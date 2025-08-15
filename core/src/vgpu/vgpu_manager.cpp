@@ -44,6 +44,8 @@ static uint32_t getVFMaxNumberByPciDeviceId(int deviceId) {
         case 0x0bdb:
         case 0x0b6e:
             return 63;
+	case 0xe211:
+	    return 24;
         default:
             return 0;
     }
@@ -139,6 +141,10 @@ xpum_result_t VgpuManager::getFunctionList(xpum_device_id_t deviceId, std::vecto
 
     int numVfs = std::stoi(numVfsString);
     XPUM_LOG_DEBUG("{} VF detected.", numVfs);
+    std::string toRemove = "card";
+    if ((deviceInfo.deviceModel == XPUM_DEVICE_MODEL_BMG) && (deviceInfo.drmPath.find(toRemove) == 0)) {
+	devicePath = std::string("/sys/kernel/debug/dri/") + deviceInfo.drmPath.substr(toRemove.length());
+    }
     /*
      *  Put PF info into index 0, and VF1..n into index 1..n respectively
      */
@@ -173,6 +179,18 @@ xpum_result_t VgpuManager::getFunctionList(xpum_device_id_t deviceId, std::vecto
                 }
                 info.lmemSize += std::stoul(lmemString);
             }
+        } else if (deviceInfo.deviceModel == XPUM_DEVICE_MODEL_BMG) {
+            if (functionIndex == 0) {
+                lmemPath = devicePath + "/gt0/pf/lmem_free";
+            } else {
+                lmemPath = devicePath + "/gt0/vf" + std::to_string(functionIndex) + "/lmem_quota";
+            }
+            try {
+                readFile(lmemPath, lmemString);
+            } catch (std::ios::failure &e) {
+                return XPUM_VGPU_SYSFS_ERROR;
+            }
+            info.lmemSize = std::stoul(lmemString);
         } else {
             return XPUM_VGPU_UNSUPPORTED_DEVICE_MODEL;
         }
@@ -236,7 +254,15 @@ xpum_result_t VgpuManager::removeAllVf(xpum_device_id_t deviceId) {
      */
     DIR *dir;
     dirent *ent;
+    std::string toRemove = "card";
     iovPath << "/sys/class/drm/" << deviceInfo.drmPath << "/iov/";
+
+    if ((deviceInfo.deviceModel == XPUM_DEVICE_MODEL_BMG) && (deviceInfo.drmPath.find(toRemove) == 0)) {    
+        iovPath.str("");
+        iovPath.clear();
+        iovPath << "/sys/kernel/debug/dri/" << deviceInfo.drmPath.substr(toRemove.length()) << "/gt0/";
+    }
+
     AttrFromConfigFile zeroAttr = {};
     if ((dir = opendir(iovPath.str().c_str())) != NULL) {
         while ((ent = readdir(dir)) != NULL) {
@@ -250,7 +276,9 @@ xpum_result_t VgpuManager::removeAllVf(xpum_device_id_t deviceId) {
                     for (uint32_t tile = 0; tile < deviceInfo.numTiles; tile++) {
                         writeVfAttrToSysfs(iovPath.str() + ent->d_name + "/gt" + std::to_string(tile), zeroAttr, 0);
                     }
-                }
+                } else if (deviceInfo.deviceModel == XPUM_DEVICE_MODEL_BMG) {
+			writeVfAttrToSysfs(iovPath.str() + ent->d_name + "/", zeroAttr, 0);
+		}
             } catch(std::ios::failure &e) {
                 closedir(dir);
                 return XPUM_VGPU_REMOVE_VF_FAILED;
@@ -954,7 +982,13 @@ bool VgpuManager::loadSriovData(xpum_device_id_t deviceId, DeviceSriovInfo &data
 
     device->getProperty(XPUM_DEVICE_PROPERTY_INTERNAL_NUMBER_OF_TILES, prop);
     data.numTiles = prop.getValueInt();
-    
+
+    std::string toRemove = "card";
+    std::string drm0;
+    if ((data.deviceModel == XPUM_DEVICE_MODEL_BMG) && (data.drmPath.find(toRemove) == 0)) {
+        drm0 = data.drmPath.substr(toRemove.length());
+    }
+
     bool available;
     bool configurable;
     xpum_ecc_state_t current, pending;
@@ -993,6 +1027,20 @@ bool VgpuManager::loadSriovData(xpum_device_id_t deviceId, DeviceSriovInfo &data
             data.contextFree += std::stoi(context);
             data.doorbellFree += std::stoi(doorbell);
         }
+    } else if (data.deviceModel == XPUM_DEVICE_MODEL_BMG) {
+        std::string pfIovPath = std::string("/sys/kernel/debug/dri/") + drm0 + "/gt0/pf/";
+        try {
+            readFile(pfIovPath + "lmem_free", lmem);
+            readFile(pfIovPath + "ggtt_free", ggtt);
+            readFile(pfIovPath + "doorbells_free", doorbell);
+            readFile(pfIovPath + "contexts_free", context);
+        } catch (std::ios::failure &e) {
+            return false;
+        }
+        data.lmemSizeFree = std::stoul(lmem);
+        data.ggttSizeFree = std::stoul(ggtt);
+        data.contextFree = std::stoi(context);
+        data.doorbellFree = std::stoi(doorbell);
     } else {
         return false;
     }
@@ -1072,6 +1120,22 @@ static bool caseInsensitiveMatch(std::string s1, std::string s2) {
 
 static void updateVgpuSchedulerConfigParamerters(std::string devicePciId, int numVfs, std::string scheduler, std::map<uint32_t, AttrFromConfigFile>& data) {
     if (devicePciId == "56c0" || devicePciId == "56c1" || devicePciId == "56c2") {
+        data[numVfs].pfExec = 20;
+        data[numVfs].pfPreempt = 20000;
+        if (caseInsensitiveMatch(scheduler, "Flexible_BurstableQoS_GPUTimeSlicing")) {
+            data[numVfs].schedIfIdle = false;
+            data[numVfs].vfExec = std::min(int(2000 / std::max(numVfs - 1, 1) * 0.5), 50);
+            data[numVfs].vfPreempt = (2000 / std::max(numVfs - 1, 1) - std::min(int((2000 / std::max(numVfs - 1 , 1)) * 0.5), 50)) * 1000;
+        } else if (caseInsensitiveMatch(scheduler, "Fixed_30fps_GPUTimeSlicing")) {
+            data[numVfs].schedIfIdle = true;
+            data[numVfs].vfExec = std::max(32 / numVfs, 1);
+            data[numVfs].vfPreempt = (numVfs == 1 ? 128000 : std::max(64000 / numVfs, 16000));
+        } else { //Flexible_30fps_GPUTimeSlicing
+            data[numVfs].schedIfIdle = false;
+            data[numVfs].vfExec = std::max(32 / numVfs, 1);
+            data[numVfs].vfPreempt = (numVfs == 1 ? 128000 : std::max(64000 / numVfs, 16000));
+        }
+    } else if (devicePciId == "e211") {
         data[numVfs].pfExec = 20;
         data[numVfs].pfPreempt = 20000;
         if (caseInsensitiveMatch(scheduler, "Flexible_BurstableQoS_GPUTimeSlicing")) {
@@ -1220,7 +1284,7 @@ xpum_result_t VgpuManager::vgpuValidateDevice(xpum_device_id_t deviceId) {
     }
     
     // Now we only need to support ATSM and some of PVC
-    std::vector<int> supportedDevices{0x56c0, 0x56c1, 0x56c2, 0x0bd4, 0x0bd5, 0x0bd6, 0x0bda, 0x0bdb, 0x0b6e};
+    std::vector<int> supportedDevices{0x56c0, 0x56c1, 0x56c2, 0x0bd4, 0x0bd5, 0x0bd6, 0x0bda, 0x0bdb, 0x0b6e, 0xe211};
     device->getProperty(XPUM_DEVICE_PROPERTY_INTERNAL_PCI_DEVICE_ID, prop);
     int pciDeviceId = std::stoi(prop.getValue().substr(2), nullptr, 16);
     if (std::find(supportedDevices.begin(), supportedDevices.end(), pciDeviceId) == supportedDevices.end()) {
@@ -1232,6 +1296,11 @@ xpum_result_t VgpuManager::vgpuValidateDevice(xpum_device_id_t deviceId) {
 
 bool VgpuManager::createVfInternal(const DeviceSriovInfo& deviceInfo, AttrFromConfigFile& attrs, uint32_t numVfs, uint64_t lmem) {
     std::string devicePathString = std::string("/sys/class/drm/") + deviceInfo.drmPath;
+    std::string toRemove = "card";
+    std::string devicePathString0;
+    if ((deviceInfo.deviceModel == XPUM_DEVICE_MODEL_BMG) && (deviceInfo.drmPath.find(toRemove) == 0)) {
+        devicePathString0 = std::string("/sys/kernel/debug/dri/") + deviceInfo.drmPath.substr(toRemove.length());
+    }
     try {
         if (deviceInfo.deviceModel == XPUM_DEVICE_MODEL_ATS_M_1 || deviceInfo.deviceModel == XPUM_DEVICE_MODEL_ATS_M_3 || deviceInfo.deviceModel == XPUM_DEVICE_MODEL_ATS_M_1G) {
             writeFile(devicePathString + "/iov/pf/gt/exec_quantum_ms", std::to_string(attrs.pfExec));
@@ -1262,7 +1331,14 @@ bool VgpuManager::createVfInternal(const DeviceSriovInfo& deviceInfo, AttrFromCo
                     }
                 }   
             }
-        }
+        } else if (deviceInfo.deviceModel == XPUM_DEVICE_MODEL_BMG) {
+            writeFile(devicePathString0 + "/gt0/pf/exec_quantum_ms", std::to_string(attrs.pfExec));
+            writeFile(devicePathString0 + "/gt0/pf/preempt_timeout_us", std::to_string(attrs.pfPreempt));
+            writeFile(devicePathString0 + "/gt0/pf/sched_if_idle", attrs.schedIfIdle ? "1": "0");
+            for (uint32_t vfNum = 1; vfNum <= numVfs; vfNum++) {
+                writeVfAttrToSysfs(devicePathString0 + "/gt0/vf" + std::to_string(vfNum) + "/", attrs, lmem);
+            }
+	}
         writeFile(devicePathString + "/device/sriov_drivers_autoprobe", attrs.driversAutoprobe ? "1" : "0");
         writeFile(devicePathString + "/device/sriov_numvfs", std::to_string(numVfs));
     } catch (std::ios::failure &e) {

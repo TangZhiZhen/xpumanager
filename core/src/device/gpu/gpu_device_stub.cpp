@@ -398,6 +398,7 @@ bool GPUDeviceStub::isLegacyPlatform(int deviceId) {
         case 0x0b6e:
         //SG1    
         case 0x4907:
+        case 0xe211:
             return true;
         default:
             return false;
